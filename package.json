@@ -1,0 +1,36 @@
+{
+  "name": "aegis-rag-server",
+  "version": "1.0.0",
+  "description": "Self-hosted Node.js & PostgreSQL (pgvector) Backend for Aegis RAG",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "migrate": "node src/database/migrate.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "rag",
+    "pgvector",
+    "postgres",
+    "express",
+    "node"
+  ],
+  "author": "Aegis RAG Team",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "geoip-lite": "^2.0.3",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.13.3",
+    "pgvector": "^0.2.0"
+  }
+}

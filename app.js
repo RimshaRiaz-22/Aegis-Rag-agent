@@ -5,7 +5,6 @@ import { config } from './src/config/env.js';
 import { requestLogger } from './src/middlewares/logging.middleware.js';
 import { errorHandler } from './src/middlewares/error.middleware.js';
 import { testDatabaseConnection } from './src/config/database.js';
-import { settingsRepository } from './src/modules/settings/settings.repository.js';
 
 // Route modules
 import authRoutes from './src/modules/auth/auth.routes.js';
@@ -15,77 +14,69 @@ import settingsRoutes from './src/modules/settings/settings.routes.js';
 import widgetRoutes from './src/modules/widget/widget.routes.js';
 import chatRoutes from './src/modules/chat/chat.routes.js';
 import visitorsRoutes from './src/modules/visitors/visitors.routes.js';
+import webSearchRoutes from './src/modules/websearch/webSearch.routes.js';
 
 const app = express();
 
-// Security headers with full support for iframe embedding and cross-origin resource requests
+// Trust reverse proxy (nginx / AWS ALB / Cloudflare / Netlify) for correct req.ip and rate limiting
+app.set('trust proxy', 1);
+
+// Security headers with support for iframe embedding on public widgets
 app.use(
   helmet({
+    contentSecurityPolicy: false,
+    hsts: false, // Prevent forcing HTTPS upgrades on local / LAN IP HTTP development
     crossOriginResourcePolicy: { policy: 'cross-origin' },
     crossOriginEmbedderPolicy: false,
     crossOriginOpenerPolicy: false,
-    frameguard: false, // Allows public embed chat widget to run smoothly in iframes
+    frameguard: false, // Allows public embed chat widget to run in customer iframes
   })
 );
 
-// Bulletproof CORS Configuration
-const corsOptions = {
-  origin: (origin, callback) => {
-    // 1. Allow non-browser callers (curl, postman, server-to-server) or file:// / null origins
-    if (!origin || origin === 'null') {
-      return callback(null, true);
-    }
+// Support Chrome Private Network Access (PNA) for LAN/cross-origin requests
+app.use((req, res, next) => {
+  if (req.headers['access-control-request-private-network']) {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
+  next();
+});
 
-    // 2. Allow any localhost or 127.0.0.1 port (dev, preview, test runners)
-    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
-      return callback(null, true);
-    }
-
-    // 3. Allow origins configured in environment
-    if (config.cors.origin.includes(origin)) {
-      return callback(null, true);
-    }
-
-    // 4. In development and embed mode, allow all origins
-    return callback(null, true);
-  },
+// Universal Permissive CORS: allow all origins with credentials & any requested headers
+const universalCorsOptions = {
+  origin: (origin, callback) => callback(null, true), // Reflects any origin, allows all (*)
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
-  allowedHeaders: [
-    'Origin',
-    'X-Requested-With',
-    'Content-Type',
-    'Accept',
-    'Authorization',
-    'Range',
-    'X-Widget-Key',
-    'Cache-Control',
-  ],
-  exposedHeaders: ['Content-Range', 'X-Total-Count', 'Authorization'],
-  maxAge: 86400, // 24-hour preflight cache
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  // Omitting allowedHeaders allows cors to dynamically accept all client headers (e.g. x-user-id, x-guest-id, x-namespace, Authorization)
 };
 
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+app.use(cors(universalCorsOptions));
+app.options('*', cors(universalCorsOptions));
 
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+
+// High-limit parser specifically for document ingestion payloads
+app.use('/api/v1/knowledge/ingest', express.json({ limit: '25mb' }));
+
+// Standard safe JSON & urlencoded parser for general API routes (prevents RAM exhaustion DoS)
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use(requestLogger);
 
 // Health check endpoint
 app.get('/health', async (req, res) => {
   try {
-    const dbHealth = await testDatabaseConnection();
+    await testDatabaseConnection();
     res.json({
       status: 'healthy',
       timestamp: new Date().toISOString(),
-      database: dbHealth,
-      uptime: process.uptime(),
+      services: { operational: true },
+      uptime: Math.floor(process.uptime()),
     });
   } catch (err) {
+    console.error('[Health Check Failure]:', err.message);
     res.status(503).json({
       status: 'unhealthy',
-      error: err.message,
+      error: 'Service temporarily unavailable',
     });
   }
 });
@@ -98,7 +89,7 @@ app.use('/api/v1/settings', settingsRoutes);
 app.use('/api/v1/widget', widgetRoutes);
 app.use('/api/v1/chat', chatRoutes);
 app.use('/api/v1/visitors', visitorsRoutes);
-app.use('/api/v1/widget/visitor', visitorsRoutes);
+app.use('/api/v1/websearch', webSearchRoutes);
 
 // 404 handler for undefined routes
 app.use((req, res) => {

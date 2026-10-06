@@ -7,7 +7,7 @@ export const visitorsService = {
   /**
    * Track or refresh a visitor session upon loading the widget.
    */
-  async trackSession({ req, namespace, visitorToken, sessionToken, pageUrl, referrer }) {
+  async trackSession({ req, namespace, visitorToken, sessionToken, fingerprint, pageUrl, referrer, pageTitle, metadata }) {
     if (!visitorToken || !sessionToken) {
       throw new Error('visitorToken and sessionToken are required');
     }
@@ -15,25 +15,37 @@ export const visitorsService = {
     // 1. Resolve agent owner
     const { ownerUserId, namespace: resolvedNamespace } = await resolveOwner(namespace, namespace);
 
-    // 2. Resolve IP and geolocation
-    const ip = extractClientIp(req);
-    const geo = resolveLocationFromIp(ip);
+    // Defense-in-depth: Exclude admin/owner traffic
+    if (
+      req.user ||
+      metadata?.is_admin ||
+      (pageUrl && (pageUrl.includes('/embed') || pageUrl.includes('admin=1') || pageUrl.includes('preview=true')))
+    ) {
+      return { ignored: true, reason: 'Admin user excluded from visitor tracking' };
+    }
 
-    // 3. Resolve device & browser info
+    // 2. Resolve IP and high-precision geolocation (Edge CDN + GeoIP)
+    const ip = extractClientIp(req);
+    const geo = resolveLocationFromIp(ip, req);
+
+    // 3. Resolve device, OS, browser, and bot classification
     const uaString = req.headers['user-agent'] || '';
     const device = parseUserAgent(uaString);
 
-    // 4. Save in repository
+    // 4. Save in repository with fingerprint and metadata
     const result = await visitorsRepository.upsertVisitorAndSession({
       ownerUserId,
       visitorToken,
       sessionToken,
+      fingerprint,
       ip,
       geo,
       device,
       pageUrl: pageUrl || referrer || 'Direct / Standalone',
+      pageTitle: pageTitle || null,
       referrer: referrer || null,
       agentNamespace: resolvedNamespace || namespace,
+      metadata: metadata || {},
     });
 
     return result;

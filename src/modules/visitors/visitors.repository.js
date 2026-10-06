@@ -8,12 +8,15 @@ export const visitorsRepository = {
     ownerUserId,
     visitorToken,
     sessionToken,
+    fingerprint,
     ip,
     geo,
     device,
     pageUrl,
+    pageTitle,
     referrer,
     agentNamespace,
+    metadata = {},
   }) {
     const client = await pool.connect();
     try {
@@ -26,8 +29,42 @@ export const visitorsRepository = {
       );
       const sessionExists = existingSessionRes.rows.length > 0;
 
-      // 2. Upsert visitor
-      // If session is new and visitor exists, increment total_visits
+      // 2. Build enriched metadata with fingerprint, bot status, and geo source
+      const enrichedMetadata = {
+        ...metadata,
+        fingerprint: fingerprint || metadata.fingerprint || null,
+        is_bot: device.isBot || false,
+        geo_source: geo.source || 'default',
+        page_title: pageTitle || null,
+        last_seen_iso: new Date().toISOString(),
+      };
+
+      // 3. Resolve effective visitor identity:
+      // If token is unknown but hardware fingerprint matches an existing visitor within the owner's domain, re-link!
+      let effectiveVisitorToken = visitorToken;
+      const existingVisitorByToken = await client.query(
+        `SELECT id, visitor_token, metadata FROM visitors WHERE owner_user_id = $1 AND visitor_token = $2;`,
+        [ownerUserId, visitorToken]
+      );
+
+      if (
+        existingVisitorByToken.rows.length === 0 &&
+        fingerprint &&
+        fingerprint !== 'fp_basic' &&
+        fingerprint !== 'fp_fallback'
+      ) {
+        const fpMatch = await client.query(
+          `SELECT id, visitor_token, metadata FROM visitors 
+           WHERE owner_user_id = $1 AND (metadata->>'fingerprint') = $2 
+           ORDER BY last_seen_at DESC LIMIT 1;`,
+          [ownerUserId, fingerprint]
+        );
+        if (fpMatch.rows.length > 0) {
+          effectiveVisitorToken = fpMatch.rows[0].visitor_token;
+        }
+      }
+
+      // 4. Upsert visitor profile
       let visitorQuery;
       let visitorParams;
 
@@ -37,12 +74,12 @@ export const visitorsRepository = {
             owner_user_id, visitor_token, first_seen_at, last_seen_at,
             total_visits, last_ip, country, country_code, city, region,
             latitude, longitude, timezone, browser, os, device_type,
-            last_page_url, last_referrer, agent_namespace, updated_at
+            last_page_url, last_referrer, agent_namespace, metadata, updated_at
           ) VALUES (
             $1, $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
             1, $3, $4, $5, $6, $7,
             $8, $9, $10, $11, $12, $13,
-            $14, $15, $16, CURRENT_TIMESTAMP
+            $14, $15, $16, $17, CURRENT_TIMESTAMP
           )
           ON CONFLICT (owner_user_id, visitor_token) DO UPDATE SET
             total_visits = visitors.total_visits + 1,
@@ -61,40 +98,41 @@ export const visitorsRepository = {
             last_page_url = EXCLUDED.last_page_url,
             last_referrer = EXCLUDED.last_referrer,
             agent_namespace = COALESCE(EXCLUDED.agent_namespace, visitors.agent_namespace),
+            metadata = COALESCE(visitors.metadata, '{}'::jsonb) || EXCLUDED.metadata,
             updated_at = CURRENT_TIMESTAMP
           RETURNING *;
         `;
+        visitorParams = [
+          ownerUserId,
+          effectiveVisitorToken,
+          ip,
+          geo.country,
+          geo.countryCode,
+          geo.city,
+          geo.region,
+          geo.latitude,
+          geo.longitude,
+          geo.timezone,
+          device.browser,
+          device.os,
+          device.deviceType,
+          pageUrl,
+          referrer,
+          agentNamespace,
+          JSON.stringify(enrichedMetadata),
+        ];
       } else {
         visitorQuery = `
           UPDATE visitors SET
             last_seen_at = CURRENT_TIMESTAMP,
             last_page_url = COALESCE($3, last_page_url),
+            metadata = COALESCE(visitors.metadata, '{}'::jsonb) || $4,
             updated_at = CURRENT_TIMESTAMP
           WHERE owner_user_id = $1 AND visitor_token = $2
           RETURNING *;
         `;
+        visitorParams = [ownerUserId, effectiveVisitorToken, pageUrl, JSON.stringify(enrichedMetadata)];
       }
-
-      visitorParams = !sessionExists
-        ? [
-            ownerUserId,
-            visitorToken,
-            ip,
-            geo.country,
-            geo.countryCode,
-            geo.city,
-            geo.region,
-            geo.latitude,
-            geo.longitude,
-            geo.timezone,
-            device.browser,
-            device.os,
-            device.deviceType,
-            pageUrl,
-            referrer,
-            agentNamespace,
-          ]
-        : [ownerUserId, visitorToken, pageUrl];
 
       const visitorRes = await client.query(visitorQuery, visitorParams);
       const visitor = visitorRes.rows[0];
@@ -289,7 +327,26 @@ export const visitorsRepository = {
    * Retrieve list of visitors for the authenticated admin.
    */
   async getVisitorsByOwner(ownerUserId, { search = '', device = '', limit = 50, offset = 0 } = {}) {
-    const conditions = ['owner_user_id = $1'];
+    // Purge any accidental admin preview visitors for this owner
+    try {
+      await pool.query(
+        `DELETE FROM visitors 
+         WHERE owner_user_id = $1 
+           AND (
+             (metadata->>'is_admin') = 'true' 
+             OR last_page_url LIKE '%/embed%'
+             OR last_page_url LIKE '%preview=true%'
+             OR last_page_url LIKE '%admin=1%'
+           );`,
+        [ownerUserId]
+      );
+    } catch (_) {}
+
+    const conditions = [
+      'owner_user_id = $1',
+      `(metadata->>'is_admin') IS DISTINCT FROM 'true'`,
+      `(last_page_url IS NULL OR (last_page_url NOT LIKE '%/embed%' AND last_page_url NOT LIKE '%preview=true%' AND last_page_url NOT LIKE '%admin=1%'))`,
+    ];
     const params = [ownerUserId];
     let paramIdx = 2;
 
@@ -369,6 +426,12 @@ export const visitorsRepository = {
    * Aggregate high-level analytics KPIs for dashboard.
    */
   async getAnalyticsOverview(ownerUserId) {
+    const nonAdminCondition = `
+      owner_user_id = $1
+      AND (metadata->>'is_admin') IS DISTINCT FROM 'true'
+      AND (last_page_url IS NULL OR (last_page_url NOT LIKE '%/embed%' AND last_page_url NOT LIKE '%preview=true%' AND last_page_url NOT LIKE '%admin=1%'))
+    `;
+
     const kpiQuery = `
       SELECT
         COUNT(id) AS total_visitors,
@@ -376,7 +439,7 @@ export const visitorsRepository = {
         COALESCE(SUM(total_messages), 0) AS total_messages,
         COALESCE(AVG(total_time_spent_seconds), 0) AS avg_duration_seconds
       FROM visitors
-      WHERE owner_user_id = $1;
+      WHERE ${nonAdminCondition};
     `;
     const kpiRes = await pool.query(kpiQuery, [ownerUserId]);
     const kpis = kpiRes.rows[0];
@@ -385,7 +448,7 @@ export const visitorsRepository = {
     const countriesQuery = `
       SELECT country, country_code, COUNT(id) AS visitor_count
       FROM visitors
-      WHERE owner_user_id = $1 AND country IS NOT NULL AND country <> 'Unknown'
+      WHERE ${nonAdminCondition} AND country IS NOT NULL AND country <> 'Unknown'
       GROUP BY country, country_code
       ORDER BY visitor_count DESC
       LIMIT 5;
@@ -396,7 +459,7 @@ export const visitorsRepository = {
     const devicesQuery = `
       SELECT device_type, COUNT(id) AS count
       FROM visitors
-      WHERE owner_user_id = $1
+      WHERE ${nonAdminCondition}
       GROUP BY device_type;
     `;
     const devicesRes = await pool.query(devicesQuery, [ownerUserId]);

@@ -2,14 +2,13 @@ import crypto from 'crypto';
 import { pool } from '../config/database.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const DEFAULT_GUEST_ID = '00000000-0000-0000-0000-000000000000';
 
 /**
  * Normalizes any identifier (standard UUID, underscored UUID, namespace, or guest ID)
- * into a valid PostgreSQL UUID string.
+ * into a valid PostgreSQL UUID string. Returns null if invalid or missing.
  */
 export function normalizeUserId(rawId) {
-  if (!rawId) return DEFAULT_GUEST_ID;
+  if (!rawId) return null;
 
   let clean = String(rawId).trim().toLowerCase();
 
@@ -29,18 +28,97 @@ export function normalizeUserId(rawId) {
     return `${hexOnly.slice(0, 8)}-${hexOnly.slice(8, 12)}-${hexOnly.slice(12, 16)}-${hexOnly.slice(16, 20)}-${hexOnly.slice(20, 32)}`;
   }
 
-  // For arbitrary guest strings (e.g. 'guest_yl6fqnb', 'guest_user'), derive a deterministic RFC-4122 v3 UUID via MD5
+  // For arbitrary guest strings (e.g. 'guest_yl6fqnb'), derive a deterministic RFC-4122 v3 UUID via MD5
   const hash = crypto.createHash('md5').update(`aegis-identity:${clean}`).digest('hex');
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-3${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
 }
 
 /**
- * Ensures that the user record exists in the users table so that any foreign key
- * constraints in knowledge_bases, documents, document_chunks, user_settings, etc.
- * will always succeed.
+ * Resolves the calling user ID from the request.
+ * Priority:
+ * 1. Authenticated user ID from req.user (verified JWT)
+ * 2. Guest header 'x-guest-id' or 'x-user-id' (strictly verified as guest or non-registered)
+ */
+export function getRequestUserId(req) {
+  if (!req) return null;
+
+  // 1. Authenticated user from JWT
+  if (req.user?.id) {
+    return req.user.id;
+  }
+
+  // 2. Client headers (guest identity)
+  const headerUserId = req.headers?.['x-guest-id'] || req.headers?.['x-user-id'];
+  if (headerUserId && typeof headerUserId === 'string' && headerUserId.trim()) {
+    return normalizeUserId(headerUserId);
+  }
+
+  // 3. Namespace header
+  const headerNs = req.headers?.['x-namespace'];
+  if (headerNs && typeof headerNs === 'string' && headerNs.startsWith('u_')) {
+    const extracted = headerNs.substring(2);
+    if (extracted && extracted.trim()) {
+      return normalizeUserId(extracted);
+    }
+  }
+
+  // 4. Query parameters
+  const queryId = req.query?.user_id || req.query?.userId || req.query?.guestId;
+  if (queryId && typeof queryId === 'string' && queryId.trim()) {
+    return normalizeUserId(queryId);
+  }
+  const queryNs = req.query?.namespace;
+  if (queryNs && typeof queryNs === 'string' && queryNs.startsWith('u_')) {
+    const extracted = queryNs.substring(2);
+    if (extracted && extracted.trim()) {
+      return normalizeUserId(extracted);
+    }
+  }
+
+  // 5. Request body
+  const bodyId = req.body?.user_id || req.body?.userId || req.body?.guestId;
+  if (bodyId && typeof bodyId === 'string' && bodyId.trim()) {
+    return normalizeUserId(bodyId);
+  }
+  const bodyNs = req.body?.namespace;
+  if (bodyNs && typeof bodyNs === 'string' && bodyNs.startsWith('u_')) {
+    const extracted = bodyNs.substring(2);
+    if (extracted && extracted.trim()) {
+      return normalizeUserId(extracted);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Checks if a user ID belongs to a registered non-guest account.
+ * Used to prevent unauthenticated guests from impersonating registered users.
+ */
+export async function isRegisteredUser(userId) {
+  if (!userId) return false;
+  try {
+    const res = await pool.query(
+      `SELECT role FROM users WHERE id = $1 LIMIT 1;`,
+      [userId]
+    );
+    if (res.rows.length > 0 && res.rows[0].role !== 'guest') {
+      return true;
+    }
+  } catch (err) {
+    console.warn('[isRegisteredUser] DB check error:', err.message);
+  }
+  return false;
+}
+
+/**
+ * Ensures that the user record exists in the users table so that foreign keys
+ * in knowledge_bases, documents, document_chunks, user_settings succeed.
  */
 export async function ensureUserExists(rawId, name = 'Guest User', email = null) {
   const userId = normalizeUserId(rawId);
+  if (!userId) return null;
+
   const userEmail = email || `guest_${userId.replace(/-/g, '')}@aegis.local`;
 
   try {
@@ -51,7 +129,6 @@ export async function ensureUserExists(rawId, name = 'Guest User', email = null)
       [userId, userEmail, name]
     );
   } catch (err) {
-    // If conflict on email, attempt with unique timestamp
     if (err.code === '23505' && err.constraint === 'users_email_key') {
       const fallbackEmail = `guest_${userId.replace(/-/g, '')}_${Date.now()}@aegis.local`;
       await pool.query(
@@ -69,15 +146,48 @@ export async function ensureUserExists(rawId, name = 'Guest User', email = null)
 }
 
 /**
+ * Completely purges all data belonging to an ephemeral guest user.
+ * Deletes knowledge bases, documents, chunks, chat threads, settings, and the guest user record.
+ * Protects registered users (role !== 'guest') from accidental deletion.
+ */
+export async function purgeGuestData(rawId) {
+  if (!rawId) return { purged: false, reason: 'No identifier provided' };
+  const userId = normalizeUserId(rawId);
+  if (!userId) return { purged: false, reason: 'Invalid identifier' };
+
+  const check = await pool.query(`SELECT id, role FROM users WHERE id = $1;`, [userId]);
+  if (check.rows.length === 0) {
+    return { purged: true, reason: 'No database records found' };
+  }
+  if (check.rows[0].role !== 'guest') {
+    return { purged: false, reason: 'Cannot purge registered non-guest user' };
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`DELETE FROM chat_threads WHERE user_id = $1;`, [userId]);
+    await client.query(`DELETE FROM user_settings WHERE user_id = $1;`, [userId]);
+    await client.query(`DELETE FROM document_chunks WHERE user_id = $1;`, [userId]);
+    await client.query(`DELETE FROM documents WHERE user_id = $1;`, [userId]);
+    await client.query(`DELETE FROM knowledge_bases WHERE user_id = $1;`, [userId]);
+    await client.query(`DELETE FROM widget_configs WHERE user_id = $1;`, [userId]);
+    await client.query(`DELETE FROM users WHERE id = $1 AND role = 'guest';`, [userId]);
+    await client.query('COMMIT');
+    console.log(`[Guest Purge] Successfully wiped all database records for guest: ${userId}`);
+    return { purged: true, userId };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`[Guest Purge] Transaction failed for ${userId}:`, err.message);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Resolves the actual owner of a widget, embed, or knowledge base.
- * Given any namespace (e.g. 'u_guest_0vhrpro') or user identifier:
- * 1. Finds the owner in knowledge_bases table (WHERE namespace = $1)
- * 2. Finds the owner in widget_configs table (WHERE config->>'namespace' = $1)
- * 3. Finds the owner in users table (by UUID or name)
- * 4. Finds the owner in documents table (by knowledge base namespace)
- * 5. Finds the owner in user_settings table
- * 6. Finds the active configured owner with saved LLM API key
- * 7. Falls back to guest provision
+ * ZERO cross-tenant credential harvesting: never falls back to an arbitrary registered user.
  */
 export async function resolveOwner(identifier, namespace) {
   const nsCandidates = new Set();
@@ -102,7 +212,39 @@ export async function resolveOwner(identifier, namespace) {
     }
   }
 
-  // 1. Look up in knowledge_bases table by namespace
+  // 1. Direct user match in users table
+  if (identifier) {
+    try {
+      const normalized = normalizeUserId(identifier);
+      if (normalized) {
+        const userRes = await pool.query(
+          `SELECT id, name, role FROM users WHERE id = $1 LIMIT 1;`,
+          [normalized]
+        );
+        if (userRes.rows.length > 0) {
+          const ownerId = userRes.rows[0].id;
+          let userNs = namespace;
+          try {
+            const kb = await pool.query(
+              `SELECT namespace FROM knowledge_bases WHERE user_id = $1 ORDER BY created_at ASC LIMIT 1;`,
+              [ownerId]
+            );
+            if (kb.rows.length > 0 && kb.rows[0].namespace) {
+              userNs = kb.rows[0].namespace;
+            }
+          } catch (_) {}
+
+          return {
+            ownerUserId: ownerId,
+            namespace: userNs || `u_${ownerId.replace(/-/g, '_')}`,
+            source: 'users',
+          };
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 2. Look up in knowledge_bases table by namespace
   for (const ns of nsCandidates) {
     try {
       const kbRes = await pool.query(
@@ -116,12 +258,10 @@ export async function resolveOwner(identifier, namespace) {
           source: 'knowledge_bases',
         };
       }
-    } catch (e) {
-      // Continue search
-    }
+    } catch (_) {}
   }
 
-  // 2. Look up in widget_configs table by namespace
+  // 3. Look up in widget_configs table by namespace
   for (const ns of nsCandidates) {
     try {
       const widgetRes = await pool.query(
@@ -138,29 +278,7 @@ export async function resolveOwner(identifier, namespace) {
           source: 'widget_configs',
         };
       }
-    } catch (e) {
-      // Continue search
-    }
-  }
-
-  // 3. Look up if identifier matches a user directly in the users table
-  if (identifier) {
-    try {
-      const normalized = normalizeUserId(identifier);
-      const userRes = await pool.query(
-        `SELECT id, name, role FROM users WHERE id = $1 LIMIT 1;`,
-        [normalized]
-      );
-      if (userRes.rows.length > 0) {
-        return {
-          ownerUserId: userRes.rows[0].id,
-          namespace: namespace || `u_${userRes.rows[0].id.replace(/-/g, '_')}`,
-          source: 'users',
-        };
-      }
-    } catch (e) {
-      // Continue search
-    }
+    } catch (_) {}
   }
 
   // 4. Look up in documents table joined with knowledge_bases
@@ -181,60 +299,45 @@ export async function resolveOwner(identifier, namespace) {
           source: 'documents',
         };
       }
-    } catch (e) {
-      // Continue search
-    }
+    } catch (_) {}
   }
 
   // 5. Look up in user_settings table
   if (identifier) {
     try {
       const normalized = normalizeUserId(identifier);
-      const setRes = await pool.query(
-        `SELECT user_id FROM user_settings WHERE user_id = $1 LIMIT 1;`,
-        [normalized]
-      );
-      if (setRes.rows.length > 0) {
-        return {
-          ownerUserId: setRes.rows[0].user_id,
-          namespace: namespace || `u_${normalized.replace(/-/g, '_')}`,
-          source: 'user_settings',
-        };
+      if (normalized) {
+        const setRes = await pool.query(
+          `SELECT user_id FROM user_settings WHERE user_id = $1 LIMIT 1;`,
+          [normalized]
+        );
+        if (setRes.rows.length > 0) {
+          return {
+            ownerUserId: setRes.rows[0].user_id,
+            namespace: namespace || `u_${normalized.replace(/-/g, '_')}`,
+            source: 'user_settings',
+          };
+        }
       }
-    } catch (e) {
-      // Continue search
-    }
+    } catch (_) {}
   }
 
-  // 6. Configured owner fallback:
-  // If an unmapped or shared link is opened, find the registered workspace user
-  // who configured an LLM API key and settings.
-  try {
-    const configuredUserRes = await pool.query(
-      `SELECT u.id, u.role
-       FROM users u
-       JOIN user_settings us ON u.id = us.user_id
-       WHERE us.has_llm_key = true
-          OR ((us.settings->>'llmApiKey') IS NOT NULL AND length(us.settings->>'llmApiKey') > 5)
-       ORDER BY (u.role = 'user') DESC, us.updated_at DESC
-       LIMIT 1;`
-    );
-    if (configuredUserRes.rows.length > 0) {
+  // If identifier provided for guest, provision an isolated guest user
+  if (identifier) {
+    const guestId = await ensureUserExists(identifier);
+    if (guestId) {
       return {
-        ownerUserId: configuredUserRes.rows[0].id,
-        namespace: namespace || `u_${configuredUserRes.rows[0].id.replace(/-/g, '_')}`,
-        source: 'primary_configured_owner',
+        ownerUserId: guestId,
+        namespace: namespace || `u_${guestId.replace(/-/g, '_')}`,
+        source: 'guest_isolated',
       };
     }
-  } catch (e) {
-    // Continue search
   }
 
-  // 7. Ultimate fallback: auto-provision guest user
-  const fallbackId = await ensureUserExists(identifier || 'default_user');
+  // No owner found - return null rather than stealing another tenant's account
   return {
-    ownerUserId: fallbackId,
-    namespace: namespace || `u_${fallbackId.replace(/-/g, '_')}`,
-    source: 'fallback_guest',
+    ownerUserId: null,
+    namespace: namespace || null,
+    source: 'unresolved',
   };
 }

@@ -20,5 +20,5 @@ export const CONSTANTS = {
   },
 
   DEFAULT_SYSTEM_PROMPT:
-    'You are Aegis, a context-grounded AI assistant. Use the following retrieved document context to answer questions accurately. Format all responses using clean standard Markdown. Do not include raw HTML tags such as <br>, <div>, or <span>. If the answer cannot be found in the context, clearly state that you do not know based on the provided documents.',
+    'You are Aegis, a professional, empathetic, and knowledgeable assistant.',
 };

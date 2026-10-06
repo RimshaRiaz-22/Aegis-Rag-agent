@@ -32,7 +32,15 @@ export const settingsService = {
   async updateSettings(userId, newSettings) {
     // Always merge with existing to avoid overwriting fields not included in this update
     const existing = await this.getSettings(userId);
-    const merged = { ...existing, ...newSettings };
+    const cleanedUpdates = { ...newSettings };
+    // Prevent accidental wipe of existing credentials if incoming update contains blank/empty strings
+    if (existing.llmApiKey && (cleanedUpdates.llmApiKey === '' || cleanedUpdates.llmApiKey === null || cleanedUpdates.llmApiKey === undefined)) {
+      delete cleanedUpdates.llmApiKey;
+    }
+    if (existing.embeddingApiKey && (cleanedUpdates.embeddingApiKey === '' || cleanedUpdates.embeddingApiKey === null || cleanedUpdates.embeddingApiKey === undefined)) {
+      delete cleanedUpdates.embeddingApiKey;
+    }
+    const merged = { ...existing, ...cleanedUpdates };
     const updated = await settingsRepository.upsert(userId, merged);
     return updated.settings;
   },

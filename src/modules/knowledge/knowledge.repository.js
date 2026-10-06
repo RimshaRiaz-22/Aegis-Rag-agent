@@ -47,23 +47,39 @@ export const knowledgeRepository = {
       await client.query('BEGIN');
 
       const insertedChunks = [];
-      for (const item of chunksData) {
-        const query = `
+      const BATCH_SIZE = 50;
+
+      for (let i = 0; i < chunksData.length; i += BATCH_SIZE) {
+        const batch = chunksData.slice(i, i + BATCH_SIZE);
+        const valueClauses = [];
+        const params = [];
+        let paramIdx = 1;
+
+        for (const item of batch) {
+          const embeddingSql = item.embedding ? pgvector.toSql(item.embedding) : null;
+          valueClauses.push(
+            `($${paramIdx}, $${paramIdx + 1}, $${paramIdx + 2}, $${paramIdx + 3}, $${paramIdx + 4}, $${paramIdx + 5}, $${paramIdx + 6})`
+          );
+          params.push(
+            item.documentId,
+            item.kbId,
+            item.userId,
+            item.chunkIndex,
+            item.content,
+            JSON.stringify(item.metadata || {}),
+            embeddingSql
+          );
+          paramIdx += 7;
+        }
+
+        const batchQuery = `
           INSERT INTO document_chunks (document_id, kb_id, user_id, chunk_index, content, metadata, embedding)
-          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          VALUES ${valueClauses.join(', ')}
           RETURNING id, document_id, chunk_index, content, metadata;
         `;
-        const embeddingSql = item.embedding ? pgvector.toSql(item.embedding) : null;
-        const { rows } = await client.query(query, [
-          item.documentId,
-          item.kbId,
-          item.userId,
-          item.chunkIndex,
-          item.content,
-          JSON.stringify(item.metadata || {}),
-          embeddingSql,
-        ]);
-        insertedChunks.push(rows[0]);
+
+        const { rows } = await client.query(batchQuery, params);
+        insertedChunks.push(...rows);
       }
 
       await client.query('COMMIT');
@@ -78,9 +94,21 @@ export const knowledgeRepository = {
 
   async listDocumentsByUser(userId, namespace = null) {
     let query = `
-      SELECT d.*, kb.namespace, kb.name as kb_name
+      SELECT d.*, kb.namespace, kb.name as kb_name,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id', dc.id,
+              'chunkIndex', dc.chunk_index,
+              'content', dc.content,
+              'metadata', dc.metadata
+            ) ORDER BY dc.chunk_index ASC
+          ) FILTER (WHERE dc.id IS NOT NULL),
+          '[]'
+        ) as chunks
       FROM documents d
       JOIN knowledge_bases kb ON d.kb_id = kb.id
+      LEFT JOIN document_chunks dc ON dc.document_id = d.id
       WHERE d.user_id = $1
     `;
     const params = [userId];
@@ -90,7 +118,7 @@ export const knowledgeRepository = {
       query += ` AND kb.namespace = $2`;
     }
 
-    query += ` ORDER BY d.created_at DESC;`;
+    query += ` GROUP BY d.id, kb.namespace, kb.name ORDER BY d.created_at DESC;`;
 
     const { rows } = await pool.query(query, params);
     return rows;

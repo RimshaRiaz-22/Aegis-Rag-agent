@@ -8,18 +8,57 @@ export const visitorsController = {
    */
   async trackSession(req, res, next) {
     try {
-      const { visitorToken, sessionToken, namespace, pageUrl, referrer } = req.body;
+      const {
+        visitorToken,
+        sessionToken,
+        namespace,
+        pageUrl,
+        referrer,
+        fingerprint,
+        pageTitle,
+        metadata,
+        isAdmin,
+      } = req.body;
+
       if (!visitorToken || !sessionToken) {
         return errorResponse(res, 'visitorToken and sessionToken are required', 400);
       }
 
+      // Check if this request is from an admin, account owner, simulator, or preview
+      const isAdminTraffic =
+        Boolean(req.user) ||
+        isAdmin === true ||
+        req.query.admin === '1' ||
+        metadata?.is_admin === true ||
+        req.headers['x-admin-preview'] === 'true' ||
+        (pageUrl &&
+          (pageUrl.includes('/embed') ||
+            pageUrl.includes('preview=true') ||
+            pageUrl.includes('admin=1')));
+
+      if (isAdminTraffic) {
+        return successResponse(
+          res,
+          { ignored: true, reason: 'Admin traffic excluded from visitor tracking' },
+          'Admin visit ignored'
+        );
+      }
+
+      const targetNamespace = namespace || req.query.namespace;
+      if (!targetNamespace) {
+        return errorResponse(res, 'Target namespace is required for visitor tracking', 400);
+      }
+
       const result = await visitorsService.trackSession({
         req,
-        namespace: namespace || req.query.namespace || 'default_user',
+        namespace: targetNamespace,
         visitorToken,
         sessionToken,
+        fingerprint,
         pageUrl,
+        pageTitle,
         referrer,
+        metadata,
       });
 
       return successResponse(res, result, 'Visitor session tracked');
@@ -33,7 +72,14 @@ export const visitorsController = {
    */
   async updateDuration(req, res, next) {
     try {
-      const { sessionToken, durationSeconds } = req.body;
+      const { sessionToken, durationSeconds, isAdmin } = req.body;
+      const isAdminTraffic =
+        Boolean(req.user) || isAdmin === true || req.query.admin === '1';
+
+      if (isAdminTraffic) {
+        return successResponse(res, { ignored: true }, 'Admin duration ignored');
+      }
+
       if (sessionToken && durationSeconds) {
         await visitorsService.updateSessionDuration(sessionToken, durationSeconds);
       }
@@ -44,12 +90,11 @@ export const visitorsController = {
   },
 
   /**
-   * Authenticated: List visitors for the current logged in user.
+   * Authenticated: List visitors for the current logged-in user.
    */
   async getVisitors(req, res, next) {
     try {
-      const rawUserId = req.user?.id || req.headers['x-guest-id'] || 'default_user';
-      const { ownerUserId } = await resolveOwner(rawUserId, req.query.namespace);
+      const ownerUserId = req.user.id;
       const data = await visitorsService.getVisitors(ownerUserId, req.query);
       return successResponse(res, data, 'Visitors retrieved successfully');
     } catch (err) {
@@ -62,8 +107,7 @@ export const visitorsController = {
    */
   async getVisitorDetails(req, res, next) {
     try {
-      const rawUserId = req.user?.id || req.headers['x-guest-id'] || 'default_user';
-      const { ownerUserId } = await resolveOwner(rawUserId, req.query.namespace);
+      const ownerUserId = req.user.id;
       const { visitorId } = req.params;
 
       const data = await visitorsService.getVisitorDetails(ownerUserId, visitorId);
@@ -78,8 +122,7 @@ export const visitorsController = {
    */
   async getAnalytics(req, res, next) {
     try {
-      const rawUserId = req.user?.id || req.headers['x-guest-id'] || 'default_user';
-      const { ownerUserId } = await resolveOwner(rawUserId, req.query.namespace);
+      const ownerUserId = req.user.id;
       const data = await visitorsService.getAnalytics(ownerUserId);
       return successResponse(res, data, 'Analytics retrieved');
     } catch (err) {
@@ -92,8 +135,7 @@ export const visitorsController = {
    */
   async deleteVisitor(req, res, next) {
     try {
-      const rawUserId = req.user?.id || req.headers['x-guest-id'] || 'default_user';
-      const { ownerUserId } = await resolveOwner(rawUserId, req.query.namespace);
+      const ownerUserId = req.user.id;
       const { visitorId } = req.params;
 
       const deleted = await visitorsService.deleteVisitor(ownerUserId, visitorId);

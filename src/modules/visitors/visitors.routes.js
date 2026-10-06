@@ -1,18 +1,31 @@
 import { Router } from 'express';
 import { visitorsController } from './visitors.controller.js';
-import { optionalAuth } from '../../middlewares/auth.middleware.js';
-import { validateBody } from '../../middlewares/validate.middleware.js';
+import { authenticate, optionalAuth } from '../../middlewares/auth.middleware.js';
+import { validateFields } from '../../middlewares/validate.middleware.js';
+import { createRateLimiter } from '../../middlewares/rateLimiter.middleware.js';
 
 const router = Router();
 
-// Public widget visitor tracking routes
-router.post('/session', validateBody(['visitorToken', 'sessionToken']), visitorsController.trackSession);
-router.post('/duration', visitorsController.updateDuration);
+const visitorTrackingLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 120,
+  message: 'Too many tracking requests.',
+});
 
-// Admin dashboard routes (supports both logged-in users and guest admins)
-router.get('/analytics', optionalAuth, visitorsController.getAnalytics);
-router.get('/', optionalAuth, visitorsController.getVisitors);
-router.get('/:visitorId', optionalAuth, visitorsController.getVisitorDetails);
-router.delete('/:visitorId', optionalAuth, visitorsController.deleteVisitor);
+// Public widget visitor tracking routes (optionalAuth to identify admin preview)
+router.post(
+  '/session',
+  visitorTrackingLimiter,
+  optionalAuth,
+  validateFields(['visitorToken', 'sessionToken']),
+  visitorsController.trackSession
+);
+router.post('/duration', visitorTrackingLimiter, optionalAuth, visitorsController.updateDuration);
+
+// Admin dashboard routes — strictly requires authenticated JWT
+router.get('/analytics', authenticate, visitorsController.getAnalytics);
+router.get('/', authenticate, visitorsController.getVisitors);
+router.get('/:visitorId', authenticate, visitorsController.getVisitorDetails);
+router.delete('/:visitorId', authenticate, visitorsController.deleteVisitor);
 
 export default router;

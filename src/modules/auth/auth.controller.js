@@ -1,5 +1,6 @@
 import { authService } from './auth.service.js';
 import { successResponse } from '../../utils/response.js';
+import { purgeGuestData } from '../../utils/userId.js';
 
 export const authController = {
   async signup(req, res, next) {
@@ -33,7 +34,6 @@ export const authController = {
   },
 
   async logout(req, res) {
-    // Stateless token is cleared client-side from sessionStorage
     return successResponse(res, null, 'Logged out successfully', 200);
   },
 
@@ -47,6 +47,21 @@ export const authController = {
         role: user.role,
         createdAt: user.created_at,
       });
+    } catch (err) {
+      next(err);
+    }
+  },
+
+  async purgeGuest(req, res, next) {
+    try {
+      const guestId =
+        req.headers['x-guest-id'] ||
+        req.body?.guestId ||
+        req.body?.guestUserId ||
+        req.body?.userId ||
+        req.query?.guestId;
+      const result = await purgeGuestData(guestId);
+      return successResponse(res, result, 'Guest data purged successfully');
     } catch (err) {
       next(err);
     }

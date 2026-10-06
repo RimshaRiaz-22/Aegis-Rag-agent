@@ -21,7 +21,7 @@ export const widgetService = {
   },
 
   async publicChat({ query, chatHistory, userId, namespace, overrideSettings = {} }) {
-    // Forward to ragService with strict user isolation
+    // Forward to ragService with strict user isolation and widget guardrails
     return await ragService.generateCompletion({
       query,
       chatHistory,
@@ -29,6 +29,22 @@ export const widgetService = {
       namespace,
       useRag: true,
       overrideSettings,
+      enableWebSearch: false,
+      isWidget: true,
+    });
+  },
+
+  async publicChatStream({ query, chatHistory, userId, namespace, overrideSettings = {}, onEvent }) {
+    return await ragService.generateCompletionStream({
+      query,
+      chatHistory,
+      userId,
+      namespace,
+      useRag: true,
+      overrideSettings,
+      enableWebSearch: false,
+      isWidget: true,
+      onEvent,
     });
   },
 };
